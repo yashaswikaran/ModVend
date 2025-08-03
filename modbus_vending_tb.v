@@ -1,259 +1,174 @@
-
-// Comprehensive Testbench for MODBUS-Controlled Smart Vending Machine
 `timescale 1ns / 1ps
 
+// ----------------------------------------------------
+// MODBUS-Controlled Smart Vending Machine Testbench
+// ----------------------------------------------------
 module modbus_vending_tb;
 
-    // Clock and reset
-    reg clk_50m;
-    reg clk_uart;
-    reg rst;
+    // Clock and Reset
+    reg clk_50m    = 0;
+    reg clk_uart   = 0;
+    reg rst        = 1;
 
     // UART signals
-    reg uart_rx;
+    reg uart_rx = 1;     // Idle = 1
     wire uart_tx;
 
-    // Test control
-    reg [7:0] test_frame [0:7];
-    integer frame_index;
-    integer bit_index;
-    reg tx_active;
+    // DUT outputs
+    wire [3:0] item_dispensed;
+    wire [3:0] item_select;
+    wire [7:0] machine_status;
 
-    // DUT instantiation
+    // Instantiate DUT (top-level system)
     modbus_vending_machine dut (
-        .clk_sys(clk_50m),
-        .clk_uart(clk_uart),
-        .rst(rst),
-        .uart_rx(uart_rx),
-        .uart_tx(uart_tx),
-        .item_dispensed(),
-        .item_select(),
-        .machine_status()
+        .clk_sys       (clk_50m),
+        .clk_uart      (clk_uart),
+        .rst           (rst),
+        .uart_rx       (uart_rx),
+        .uart_tx       (uart_tx),
+        .item_dispensed(item_dispensed),
+        .item_select   (item_select),
+        .machine_status(machine_status)
     );
 
-    // Clock generation
-    initial begin
-        clk_50m = 0;
-        forever #10 clk_50m = ~clk_50m; // 50MHz system clock
-    end
+    // Generate 50MHz system clock
+    always #10 clk_50m = ~clk_50m;    // 20ns period
 
-    initial begin
-        clk_uart = 0;
-        forever #26041 clk_uart = ~clk_uart; // 19200 baud clock
-    end
+    // Generate UART baud clock approximating 19200 baud
+    always #26041 clk_uart = ~clk_uart; // ~52us per full cycle (26us half cycle)
 
-    // Test stimulus
+    // --------------------------------
+    // Test Sequencer
+    // --------------------------------
     initial begin
-        // Initialize
+        // Reset system
         rst = 1;
-        uart_rx = 1; // UART idle high
-        tx_active = 0;
-        frame_index = 0;
-        bit_index = 0;
-
         #1000;
         rst = 0;
+        #10000;  // Wait for system init
 
-        // Wait for system to stabilize
-        #10000;
+        $display("==== MODBUS Vending Machine Testbench START ====");
 
-        $display("Starting MODBUS RTU Tests...");
+        // ---- TEST 1: Read Holding Register (Function 03, Item 1) ----
+        $display("TEST1: MODBUS Read (Inventory Item 1)");
+        send_modbus_frame(8'h01, 8'h03, 16'h0001, 16'h0001); // slave=1, fc=3, addr=0001, qty=1
+        wait_for_uart_response();
 
-        // Test Case 1: Read Holding Register (Function Code 03)
-        $display("Test 1: Read item inventory (Function Code 03)");
-        test_frame[0] = 8'h01; // Slave address
-        test_frame[1] = 8'h03; // Function code - Read Holding Registers
-        test_frame[2] = 8'h00; // Starting address high byte
-        test_frame[3] = 8'h01; // Starting address low byte (item 1)
-        test_frame[4] = 8'h00; // Quantity high byte
-        test_frame[5] = 8'h01; // Quantity low byte (1 register)
-        test_frame[6] = 8'hD5; // CRC low byte
-        test_frame[7] = 8'hCA; // CRC high byte
+        #60000; // Inter-frame silent period
 
-        send_modbus_frame(8);
-        wait_for_response();
+        // ---- TEST 2: Dispense Command (Function 06) ----
+        $display("TEST2: MODBUS Write Single Register (Dispense Item)");
+        send_modbus_frame(8'h01, 8'h06, 16'h0100, 16'h0001); // reg=0x0100 (dispense), value=1
+        wait_for_uart_response();
 
-        #50000; // Inter-frame delay
+        #60000;
 
-        // Test Case 2: Write Single Register (Function Code 06) - Dispense Item
-        $display("Test 2: Dispense item (Function Code 06)");
-        test_frame[0] = 8'h01; // Slave address
-        test_frame[1] = 8'h06; // Function code - Write Single Register
-        test_frame[2] = 8'h01; // Register address high byte
-        test_frame[3] = 8'h00; // Register address low byte (dispense command)
-        test_frame[4] = 8'h00; // Data high byte
-        test_frame[5] = 8'h01; // Data low byte (dispense item 1)
-        test_frame[6] = 8'h08; // CRC low byte
-        test_frame[7] = 8'h0A; // CRC high byte
-
-        send_modbus_frame(8);
-        wait_for_response();
-
-        #50000;
-
-        // Test Case 3: Invalid Function Code (Exception Test)
-        $display("Test 3: Invalid function code (Exception handling)");
-        test_frame[0] = 8'h01; // Slave address
-        test_frame[1] = 8'h99; // Invalid function code
-        test_frame[2] = 8'h00; // Dummy data
-        test_frame[3] = 8'h01;
-        test_frame[4] = 8'h00;
-        test_frame[5] = 8'h01;
-        test_frame[6] = 8'hAA; // Dummy CRC
-        test_frame[7] = 8'hBB;
-
-        send_modbus_frame(8);
-        wait_for_response();
+        // ---- TEST 3: Invalid Function (should return exception) ----
+        $display("TEST3: MODBUS Invalid Function Code");
+        send_modbus_frame(8'h01, 8'h99, 16'h0001, 16'h0001); // Invalid FC=0x99
+        wait_for_uart_response();
 
         #100000;
-        $display("All tests completed!");
+
+        $display("==== All MODBUS test cases completed ====");
         $finish;
     end
 
-    // Task to send MODBUS frame
-    task send_modbus_frame(input integer frame_len);
-        integer i, j;
-        begin
-            // 3.5 character silence before frame
-            #91666; // 3.5 * (11 bits * 52083ns) at 19200 baud
+    // --------------------
+    // Utility TASKS
+    // --------------------
 
-            for (i = 0; i < frame_len; i = i + 1) begin
-                send_uart_byte(test_frame[i]);
-
-                // Ensure gap between bytes is less than 1.5 characters
-                if (i < frame_len - 1) begin
-                    #26041; // Small gap between bytes
-                end
-            end
-
-            $display("Sent MODBUS frame: %h %h %h %h %h %h %h %h", 
-                     test_frame[0], test_frame[1], test_frame[2], test_frame[3],
-                     test_frame[4], test_frame[5], test_frame[6], test_frame[7]);
-        end
-    endtask
-
-    // Task to send single UART byte
-    task send_uart_byte(input [7:0] data);
+    // Task: Send MODBUS RTU frame (8N1, LSB first, no parity)
+    task send_modbus_frame(input [7:0] slave, input [7:0] fcode, input [15:0] addr, input [15:0] val);
+        reg [7:0] frame[0:7];
+        reg [15:0] crc;
         integer i;
         begin
-            // Start bit
-            uart_rx = 0;
-            #52083; // Bit time at 19200 baud
+            // Assemble frame (MODBUS RTU spec)
+            frame[0] = slave;                          // Slave address
+            frame[1] = fcode;                          // Function code
+            frame[2] = addr[15:8];                     // Address (hi)
+            frame[3] = addr[7:0];                      // Address (lo)
+            frame[4] = val[15:8];                      // Data/qty hi
+            frame[5] = val[7:0];                       // Data/qty lo
 
-            // Data bits (LSB first)
-            for (i = 0; i < 8; i = i + 1) begin
-                uart_rx = data[i];
-                #52083;
-            end
+            // --- Compute MODBUS CRC
+            calc_crc16_modbus(frame, 6, crc);
+            frame[6] = crc[7:0];
+            frame[7] = crc[15:8];
 
-            // Parity bit (even parity)
-            uart_rx = ^data; // XOR of all data bits
-            #52083;
+            // Inter-frame gap (3.5 char = ~183 us for 19200 baud)
+            uart_rx = 1; #190000; // 3.5 * (1/19200)*11*1e9 ≈ 200us
 
-            // Stop bit
-            uart_rx = 1;
-            #52083;
+            // Send frame bytes, one at a time
+            for (i = 0; i < 8; i = i + 1)
+                send_uart_byte(frame[i]);
+
+            $display("SENT: MODBUS [%02h %02h %02h %02h %02h %02h] CRC=%04h (Frame: %h %h %h %h %h %h %h %h)",
+                frame[0], frame[1], frame[2], frame[3], frame[4], frame[5], crc, 
+                frame[0], frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7]);
         end
     endtask
 
-    // Task to wait for response
-    task wait_for_response();
+    // Task: Send one byte on UART (8N1, LSB first, no parity)
+    task send_uart_byte(input [7:0] dat);
+        integer k;
         begin
-            // Wait for potential response
-            #200000;
-            $display("Response wait completed");
+            // Start bit (0)
+            uart_rx = 0; #52083;
+            // Data
+            for (k=0; k<8; k=k+1) begin
+                uart_rx = dat[k]; #52083;
+            end
+            // Stop bit (1)
+            uart_rx = 1; #52083;
         end
     endtask
 
-    // Monitor for debugging
-    initial begin
-        $monitor("Time: %0t, UART_RX: %b, RST: %b", $time, uart_rx, rst);
-    end
+    // Task: Wait for UART TX activity window
+    task wait_for_uart_response();
+        integer t;
+        begin
+            // Wait for TX (you may enhance by actively monitoring uart_tx for real-time response capture)
+            #300000; // ~300us nominal
+            $display("   ...Response wait window elapsed");
+        end
+    endtask
 
-    // VCD dump for waveform analysis
+    // ---------------------------
+    // MODBUS CRC-16 TASK
+    // ---------------------------
+    // (Standard poly=0xA001, init=0xFFFF, LSB first)
+    task calc_crc16_modbus(input [7:0] dat[0:5], input integer len, output reg [15:0] crc);
+        integer i, j;
+        reg [7:0] b;
+        begin
+            crc = 16'hFFFF;
+            for (i = 0; i < len; i = i + 1) begin
+                b = dat[i];
+                crc = crc ^ b;
+                for (j = 0; j < 8; j = j + 1) begin
+                    if (crc[0])
+                        crc = (crc >> 1) ^ 16'hA001;
+                    else
+                        crc = crc >> 1;
+                end
+            end
+        end
+    endtask
+
+    // --------------------------------
+    // VCD Waveform Dump
+    // --------------------------------
     initial begin
         $dumpfile("modbus_vending_tb.vcd");
         $dumpvars(0, modbus_vending_tb);
     end
 
-endmodule
-
-// Top-level MODBUS Vending Machine Module (skeleton)
-module modbus_vending_machine (
-    input wire clk_sys,
-    input wire clk_uart, 
-    input wire rst,
-    input wire uart_rx,
-    output wire uart_tx,
-    output wire [3:0] item_dispensed,
-    output wire [3:0] item_select,
-    output wire [7:0] machine_status
-);
-
-    // Internal signals
-    wire [7:0] rx_data, tx_data;
-    wire rx_valid, tx_valid, tx_ready;
-    wire fifo_full, fifo_empty;
-    wire [15:0] inv_addr, inv_data_in, inv_data_out;
-    wire inv_we;
-
-    // UART Interface
-    uart_interface uart_inst (
-        .clk(clk_uart),
-        .rst(rst),
-        .uart_rx(uart_rx),
-        .uart_tx(uart_tx),
-        .rx_data(rx_data),
-        .rx_valid(rx_valid),
-        .tx_data(tx_data),
-        .tx_valid(tx_valid),
-        .tx_ready(tx_ready)
-    );
-
-    // Dual Clock FIFO
-    dual_clock_fifo fifo_inst (
-        .wr_clk(clk_uart),
-        .wr_rst(rst),
-        .wr_data(rx_data),
-        .wr_en(rx_valid),
-        .wr_full(fifo_full),
-        .rd_clk(clk_sys),
-        .rd_rst(rst),
-        .rd_data(rx_data_sync),
-        .rd_en(fifo_rd_en),
-        .rd_empty(fifo_empty)
-    );
-
-    // MODBUS FSM
-    modbus_fsm fsm_inst (
-        .clk(clk_sys),
-        .rst(rst),
-        .rx_data(rx_data_sync),
-        .rx_valid(~fifo_empty),
-        .tx_data(tx_data),
-        .tx_valid(tx_valid),
-        .inv_addr(inv_addr),
-        .inv_wr_data(inv_data_in),
-        .inv_rd_data(inv_data_out),
-        .inv_wr_en(inv_we),
-        .dispense_item(item_dispensed[0]),
-        .item_select(item_select)
-    );
-
-    // Dual Port RAM for inventory
-    dual_port_ram inventory_ram (
-        .clk_a(clk_sys),
-        .addr_a(inv_addr[7:0]),
-        .data_a(inv_data_in),
-        .we_a(inv_we),
-        .q_a(inv_data_out),
-        .clk_b(clk_sys),
-        .addr_b(8'h00),
-        .data_b(16'h0000),
-        .we_b(1'b0),
-        .q_b()
-    );
-
-    assign machine_status = {4'b0000, item_select};
+    // Monitor
+    initial begin
+        $monitor("T=%0t | RX=%b, TX=%b | DISP=%b, SEL=%b, STAT=%h",
+            $time, uart_rx, uart_tx, item_dispensed, item_select, machine_status);
+    end
 
 endmodule

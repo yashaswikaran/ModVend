@@ -1,0 +1,7 @@
+read_verilog uart_interface.v dual_clock_fifo.v modbus_fsm.v dual_port_ram.v modbus_smart_vending_machine.v
+synth_xilinx -top modbus_smart_vending_machine
+stat
+write_edif modbus_vending.edf
+write_json modbus_vending.json
+write_blif modbus_vending.blif
+
