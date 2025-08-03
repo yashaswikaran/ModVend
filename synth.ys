@@ -1,7 +1,24 @@
-read_verilog uart_interface.v dual_clock_fifo.v modbus_fsm.v dual_port_ram.v modbus_smart_vending_machine.v
-synth_xilinx -top modbus_smart_vending_machine
-stat
-write_edif modbus_vending.edf
-write_json modbus_vending.json
-write_blif modbus_vending.blif
+# Read all Verilog source files
+read -sv top-module.v
+read -sv payment_controller.v
+read -sv change_dispenser.v
+read -sv vending_controller.v
+read -sv uart_interface.v
+read -sv dual_clock_fifo.v
+read -sv dual_port_ram.v
+read -sv modbus_fsm.v
 
+# Set top module
+hierarchy -check -top modbus_smart_vending_machine
+
+# General synthesis steps
+proc; opt; techmap; opt
+
+# Optional: Map to your target (e.g., iCE40, ECP5, ASIC, or generic gates)
+# For a technology-mapped netlist, add:
+# dfflibmap -liberty mycells.lib
+# abc -liberty mycells.lib
+# clean
+
+# Write synthesized netlist in Verilog
+write_verilog synth_vending_machine.v

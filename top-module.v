@@ -1,11 +1,13 @@
-
-// Top-Level MODBUS-Controlled Smart Vending Machine
+//============================================================================
+// TOP MODULE: modbus_smart_vending_machine
 // Complete system integration with all components
+//============================================================================
 module modbus_smart_vending_machine #(
     parameter BAUD_RATE = 19200,
     parameter CLK_FREQ = 50_000_000,
     parameter SLAVE_ADDR = 8'h01,
-    parameter NUM_ITEMS = 16
+    parameter NUM_ITEMS = 16,
+    parameter PRICE_WIDTH = 16
 )(
     // System clocks and reset
     input wire clk_sys,          // 50MHz system clock
@@ -25,10 +27,19 @@ module modbus_smart_vending_machine #(
     input wire [NUM_ITEMS-1:0] item_sensors,  // Item presence sensors
     output wire [NUM_ITEMS-1:0] dispense_motors, // Motor control
 
+    // Payment interface
+    input wire [8:0] coin_inputs,       // Coin denomination inputs (1,2,5,10,20,50,100,500,2000)
+    input wire coin_inserted,           // Coin insertion event
+    input wire payment_complete,        // User finished inserting coins
+    input wire transaction_cancel,      // Cancel transaction
+    output wire [8:0] change_motors,    // Change dispensing motors
+
     // LED indicators
     output wire status_led,             // System status
     output wire error_led,              // Error indicator
-    output wire comm_led                // Communication activity
+    output wire comm_led,               // Communication activity
+    output wire payment_accepted_led,   // Payment successful
+    output wire payment_rejected_led    // Payment rejected
 );
 
     // Internal signal declarations
@@ -46,15 +57,33 @@ module modbus_smart_vending_machine #(
     wire modbus_wr_en, modbus_rd_en;
     wire [7:0] modbus_func_code;
     wire modbus_frame_error;
+    wire dispense_cmd_modbus;
 
-    // Inventory RAM signals
+    // Inventory RAM signals (Port A - MODBUS, Port B - System)
     wire [7:0] inv_addr_a, inv_addr_b;
     wire [15:0] inv_data_a, inv_data_b;
     wire [15:0] inv_q_a, inv_q_b;
     wire inv_we_a, inv_we_b;
 
+    // Price RAM signals (Port A - MODBUS, Port B - Payment)
+    wire [7:0] price_addr_a, price_addr_b;
+    wire [15:0] price_data_a, price_data_b;
+    wire [15:0] price_q_a, price_q_b;
+    wire price_we_a, price_we_b;
+
+    // Payment controller signals
+    wire [3:0] selected_item;
+    wire [PRICE_WIDTH-1:0] total_inserted;
+    wire payment_start;
+    wire dispense_cmd_payment;
+    wire payment_accepted, payment_rejected;
+    wire [PRICE_WIDTH-1:0] change_amount;
+    wire change_ready;
+    wire change_dispensed;
+    wire vending_error;
+
     // Control signals
-    wire dispense_cmd;
+    wire dispense_cmd_final;
     wire [3:0] dispense_item;
     reg [15:0] status_register;
 
@@ -132,7 +161,8 @@ module modbus_smart_vending_machine #(
         .func_code(modbus_func_code),
         .frame_error(modbus_frame_error),
         .dispense_item(dispense_item),
-        .dispense_cmd(dispense_cmd)
+        .dispense_cmd(dispense_cmd_modbus),
+        .selected_item_out(selected_item)
     );
 
     //========================================================================
@@ -147,8 +177,8 @@ module modbus_smart_vending_machine #(
         .clk_a(clk_sys),
         .addr_a(modbus_reg_addr[7:0]),
         .data_a(modbus_wr_data),
-        .we_a(modbus_wr_en),
-        .q_a(modbus_rd_data),
+        .we_a(modbus_wr_en & (modbus_reg_addr[15:8] == 8'h00)), // Inventory at 0x00xx
+        .q_a(inv_q_a),
 
         // Port B - System access
         .clk_b(clk_sys),
@@ -159,15 +189,87 @@ module modbus_smart_vending_machine #(
     );
 
     //========================================================================
-    // Vending Machine Control Logic
+    // Dual Port RAM for Price Storage
     //========================================================================
-    vending_controller vend_ctrl (
+    dual_port_ram #(
+        .DATA_WIDTH(16),
+        .ADDR_WIDTH(8),
+        .DEPTH(256)
+    ) price_memory (
+        // Port A - MODBUS access for price setting
+        .clk_a(clk_sys),
+        .addr_a(modbus_reg_addr[7:0]),
+        .data_a(modbus_wr_data),
+        .we_a(modbus_wr_en & (modbus_reg_addr[15:8] == 8'h01)), // Prices at 0x01xx
+        .q_a(price_q_a),
+
+        // Port B - Payment controller access
+        .clk_b(clk_sys),
+        .addr_b(price_addr_b),
+        .data_b(16'h0000),
+        .we_b(1'b0),
+        .q_b(price_q_b)
+    );
+
+    //========================================================================
+    // Payment Controller with Multi-Denomination Support
+    //========================================================================
+    payment_controller #(
+        .NUM_ITEMS(NUM_ITEMS),
+        .PRICE_WIDTH(PRICE_WIDTH)
+    ) payment_ctrl (
         .clk(clk_sys),
         .rst(rst),
 
-        // Dispense commands
-        .dispense_cmd(dispense_cmd),
-        .item_select(dispense_item),
+        // Coin interface
+        .coin_inputs(coin_inputs),
+        .coin_inserted(coin_inserted),
+        .payment_complete(payment_complete),
+        .transaction_cancel(transaction_cancel),
+
+        // Item selection interface
+        .selected_item(selected_item),
+        .start_transaction(payment_start),
+
+        // Price memory interface
+        .price_mem_addr(price_addr_b),
+        .price_mem_data(price_q_b),
+
+        // Outputs
+        .dispense_cmd(dispense_cmd_payment),
+        .payment_accepted(payment_accepted),
+        .payment_rejected(payment_rejected),
+        .total_inserted(total_inserted),
+        .change_amount(change_amount),
+        .change_ready(change_ready)
+    );
+
+    //========================================================================
+    // Change Dispensing Controller
+    //========================================================================
+    change_dispenser #(
+        .PRICE_WIDTH(PRICE_WIDTH)
+    ) change_ctrl (
+        .clk(clk_sys),  
+        .rst(rst),
+        .change_amount(change_amount),
+        .dispense_change(change_ready),
+        .change_motors(change_motors),
+        .change_complete(change_dispensed)
+    );
+
+    //========================================================================
+    // Vending Machine Control Logic
+    //========================================================================
+    vending_controller #(
+        .NUM_ITEMS(NUM_ITEMS)
+    ) vend_ctrl (
+        .clk(clk_sys),
+        .rst(rst),
+
+        // Dispense commands (priority to payment controller)
+        .dispense_cmd(dispense_cmd_final),
+        .item_select(selected_item),
 
         // Inventory interface
         .inv_addr(inv_addr_b),
@@ -182,8 +284,17 @@ module modbus_smart_vending_machine #(
         // Status
         .dispense_active(dispense_trigger),
         .current_item(item_select),
-        .error_state(error_led)
+        .error_state(vending_error)
     );
+
+    // Logic to determine dispense command source
+    assign payment_start = dispense_cmd_modbus; // MODBUS triggers payment check
+    assign dispense_cmd_final = payment_accepted & dispense_cmd_payment;
+
+    // Status register assembly for MODBUS read access
+    assign modbus_rd_data = (modbus_reg_addr[15:8] == 8'h00) ? inv_q_a :
+                           (modbus_reg_addr[15:8] == 8'h01) ? price_q_a :
+                           (modbus_reg_addr == 16'hFF00) ? status_register : 16'h0000;
 
     //========================================================================
     // Status and Indicator Logic
@@ -202,143 +313,34 @@ module modbus_smart_vending_machine #(
             end
 
             // Error indicator timeout
-            if (modbus_frame_error) begin
+            if (modbus_frame_error || vending_error || payment_rejected) begin
                 error_timeout <= 16'hFFFF;   // ~1.3ms at 50MHz
             end else if (error_timeout > 0) begin
                 error_timeout <= error_timeout - 1;
             end
 
-            // Status register assembly
+            // Status register assembly (readable via MODBUS at 0xFF00)
             status_register <= {
-                4'b0000,           // Reserved
-                dispense_trigger,  // Bit 11: Dispensing active
-                error_led,         // Bit 10: Error state
-                comm_led,          // Bit 9: Communication active
-                status_led,        // Bit 8: System ready
-                item_select,       // Bits 7-4: Current item
-                modbus_func_code[3:0] // Bits 3-0: Last function code
+                change_dispensed,      // Bit 15: Change dispensing complete
+                payment_accepted,      // Bit 14: Payment accepted
+                payment_rejected,      // Bit 13: Payment rejected
+                dispense_trigger,      // Bit 12: Dispensing active
+                vending_error,         // Bit 11: Vending error
+                comm_led,              // Bit 10: Communication active
+                status_led,            // Bit 9: System ready
+                1'b0,                  // Bit 8: Reserved
+                item_select,           // Bits 7-4: Current item
+                modbus_func_code[3:0]  // Bits 3-0: Last function code
             };
         end
     end
 
     // Output assignments
     assign machine_status = status_register[7:0];
-    assign status_led = ~rst & ~error_led;
+    assign status_led = ~rst & ~vending_error;
     assign comm_led = (comm_timeout > 0);
     assign error_led = (error_timeout > 0) | modbus_frame_error;
-
-endmodule
-
-//============================================================================
-// Vending Machine Controller - Handles physical dispensing operations
-//============================================================================
-module vending_controller #(
-    parameter NUM_ITEMS = 16,
-    parameter DISPENSE_TIME = 50000000  // 1 second at 50MHz
-)(
-    input wire clk,
-    input wire rst,
-
-    // Command interface
-    input wire dispense_cmd,
-    input wire [3:0] item_select,
-
-    // Inventory interface
-    output reg [7:0] inv_addr,
-    output reg [15:0] inv_data_out,
-    input wire [15:0] inv_data_in,
-    output reg inv_we,
-
-    // Physical interface
-    input wire [NUM_ITEMS-1:0] item_sensors,
-    output reg [NUM_ITEMS-1:0] dispense_motors,
-
-    // Status outputs
-    output reg dispense_active,
-    output reg [3:0] current_item,
-    output reg error_state
-);
-
-    // State machine for dispensing
-    localparam IDLE = 2'b00,
-               CHECK_STOCK = 2'b01,
-               DISPENSE = 2'b10,
-               UPDATE_INV = 2'b11;
-
-    reg [1:0] state, next_state;
-    reg [31:0] dispense_timer;
-    reg [15:0] current_stock;
-
-    always @(posedge clk) begin
-        if (rst) begin
-            state <= IDLE;
-            dispense_timer <= 0;
-            dispense_motors <= 0;
-            dispense_active <= 0;
-            current_item <= 0;
-            error_state <= 0;
-            inv_addr <= 0;
-            inv_data_out <= 0;
-            inv_we <= 0;
-        end else begin
-            state <= next_state;
-
-            case (state)
-                IDLE: begin
-                    dispense_active <= 0;
-                    dispense_motors <= 0;
-                    if (dispense_cmd) begin
-                        current_item <= item_select;
-                        inv_addr <= item_select;
-                        inv_we <= 0;
-                    end
-                end
-
-                CHECK_STOCK: begin
-                    current_stock <= inv_data_in;
-                    if (inv_data_in == 0) begin
-                        error_state <= 1;  // Out of stock
-                    end else if (!item_sensors[item_select]) begin
-                        error_state <= 1;  // Item not detected
-                    end
-                end
-
-                DISPENSE: begin
-                    dispense_active <= 1;
-                    dispense_motors[current_item] <= 1;
-                    if (dispense_timer < DISPENSE_TIME) begin
-                        dispense_timer <= dispense_timer + 1;
-                    end
-                end
-
-                UPDATE_INV: begin
-                    dispense_motors <= 0;
-                    inv_addr <= current_item;
-                    inv_data_out <= current_stock - 1;
-                    inv_we <= 1;
-                end
-            endcase
-        end
-    end
-
-    // Next state logic
-    always @(*) begin
-        next_state = state;
-        case (state)
-            IDLE: begin
-                if (dispense_cmd) next_state = CHECK_STOCK;
-            end
-            CHECK_STOCK: begin
-                if (error_state) next_state = IDLE;
-                else next_state = DISPENSE;
-            end
-            DISPENSE: begin
-                if (dispense_timer >= DISPENSE_TIME) next_state = UPDATE_INV;
-            end
-            UPDATE_INV: begin
-                next_state = IDLE;
-            end
-        endcase
-    end
+    assign payment_accepted_led = payment_accepted;
+    assign payment_rejected_led = payment_rejected;
 
 endmodule
